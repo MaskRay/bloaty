@@ -226,6 +226,7 @@ class ElfFile {
   string_view section_headers_;
   string_view segment_headers_;
   Section section_name_table_;
+  mutable std::vector<Elf64_Shdr> cshdrs;
 };
 
 // ELF uses different structure definitions for 32/64 bit files.  The sizes of
@@ -504,8 +505,8 @@ bool ElfFile::Initialize() {
   }
 
   header_region_ = GetRegion(0, header_.e_ehsize);
-  section_headers_ = GetRegion(header_.e_shoff,
-                               CheckedMul(header_.e_shentsize, section_count_));
+  section_headers_ =
+      GetRegion(header_.e_shoff, entire_file().size() - header_.e_shoff);
   segment_headers_ = GetRegion(
       header_.e_phoff, CheckedMul(header_.e_phentsize, header_.e_phnum));
 
@@ -533,17 +534,54 @@ void ElfFile::ReadSegment(Elf64_Word index, Segment* segment) const {
   segment->contents_ = GetRegion(header->p_offset, header->p_filesz);
 }
 
+inline uint64_t readLEB128(const uint8_t *&p, uint64_t leb) {
+  uint64_t acc = 0, shift = 0, byte;
+  do {
+    byte = *p++;
+    acc |= (byte - 128 * (byte >= leb)) << shift;
+    shift += 7;
+  } while (byte >= 128);
+  return acc;
+}
+
+inline uint64_t readULEB128(const uint8_t *&p) { return readLEB128(p, 128); }
+inline int64_t readSLEB128(const uint8_t *&p) { return readLEB128(p, 64); }
+
 void ElfFile::ReadSection(Elf64_Word index, Section* section) const {
   if (index >= section_count_) {
     THROWF("tried to read section $0, but there are only $1", index,
            section_count_);
   }
 
+  if (header_.e_shentsize == 0 && index == 0) {
+    auto* p = (const uint8_t*)entire_file().data() + header_.e_shoff;
+    cshdrs.clear();
+    cshdrs.resize(header_.e_shnum);
+    for (uint32_t i = 0; i != header_.e_shnum; i++) {
+      Elf64_Shdr& shdr = cshdrs[i];
+      uint8_t presence = *p++;
+      shdr.sh_name = readULEB128(p);
+      shdr.sh_type = presence & 1 ? readULEB128(p) : SHT_PROGBITS;
+      shdr.sh_flags = presence & 2 ? readULEB128(p) : 0;
+      shdr.sh_addr = presence & 4 ? readULEB128(p) : 0;
+      shdr.sh_offset = readULEB128(p);
+      shdr.sh_size = presence & 8 ? readULEB128(p) : 0;
+      shdr.sh_link = presence & 16 ? readULEB128(p) : 0;
+      shdr.sh_info = presence & 32 ? readULEB128(p) : 0;
+      shdr.sh_addralign = presence & 64 ? Elf64_Xword(1) << readULEB128(p) : 1;
+      shdr.sh_entsize = presence & 128 ? readULEB128(p) : 0;
+    }
+  }
+
   Elf64_Shdr* header = &section->header_;
-  ReadStruct<Elf32_Shdr>(
-      entire_file(),
-      CheckedAdd(header_.e_shoff, CheckedMul(header_.e_shentsize, index)),
-      ShdrMunger(), &section->range_, header);
+  if (header_.e_shentsize == 0) {
+    *header = cshdrs[index];
+  } else {
+    ReadStruct<Elf32_Shdr>(
+        entire_file(),
+        CheckedAdd(header_.e_shoff, CheckedMul(header_.e_shentsize, index)),
+        ShdrMunger(), &section->range_, header);
+  }
 
   if (header->sh_type == SHT_NOBITS) {
     section->contents_ = string_view();
